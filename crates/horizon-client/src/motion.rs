@@ -343,6 +343,9 @@ pub struct PlayerMotion {
     /// Asleep in a bed (`LivingEntity.isSleeping`): the sleeping pose.
     pub sleeping: bool,
     pub fall_fly_ticks: i32,
+    /// Last local tick that played Elytra wall feedback. An attached firework
+    /// can restore speed every tick while the player remains against one wall.
+    pub last_fall_flying_wall_sound_tick: Option<i32>,
     /// The server saw the glide end last tick (`updateFallFlying`'s `canGlide`
     /// failed): the cleared flag reaches the client at its next tick.
     pub glide_ending: bool,
@@ -1350,17 +1353,20 @@ impl MotionWorld<'_, '_, '_> {
         if !self.player.flying
             && (self.player.fluids.was_touching_water || self.player.is_in_lava())
         {
+            self.player.last_fall_flying_wall_sound_tick = None;
             horizon_world::living_fluid::travel_in_fluid(self, input)?;
         } else if self.player.fall_flying {
             // LivingEntity.travelFallFlying: on a climbable the glide ends and
             // the player moves like in the air.
             if self.climbable()? {
+                self.player.last_fall_flying_wall_sound_tick = None;
                 self.travel_in_air(input)?;
                 self.player.fall_flying = false;
             } else {
                 self.travel_fall_flying()?;
             }
         } else {
+            self.player.last_fall_flying_wall_sound_tick = None;
             self.travel_in_air(input)?;
         }
         if let Some(y) = flying_y {
@@ -2059,20 +2065,33 @@ impl MotionWorld<'_, '_, '_> {
             let dmg = fly_into_wall_damage(move_h, after_h);
             if dmg > 0.0 {
                 let first = self.player.events.len();
-                // getFallDamageSound((int) dmg)
-                let sound = if dmg as i32 > 4 {
-                    crate::landing::SceneSound::BigFall
-                } else {
-                    crate::landing::SceneSound::SmallFall
-                };
-                self.player
-                    .events
-                    .push(MotionEvent::Fall(crate::landing::FallEvent::Sound {
-                        sound,
-                        position: None,
-                        volume: 1.0,
-                        pitch: 1.0,
-                    }));
+                // The server's Player.playSound excludes the glider (#8906), so
+                // the local client predicts this feedback. An attached firework
+                // can restore speed every tick against the same wall; only play
+                // the local sound once on consecutive collision ticks.
+                let repeated_local_impact = self.player.client_side
+                    && self.player.last_fall_flying_wall_sound_tick
+                        == Some(self.player.fall_fly_ticks.saturating_sub(1));
+                if !repeated_local_impact {
+                    // getFallDamageSound((int) dmg)
+                    let sound = if dmg as i32 > 4 {
+                        crate::landing::SceneSound::BigFall
+                    } else {
+                        crate::landing::SceneSound::SmallFall
+                    };
+                    self.player
+                        .events
+                        .push(MotionEvent::Fall(crate::landing::FallEvent::Sound {
+                            sound,
+                            position: None,
+                            volume: 1.0,
+                            pitch: 1.0,
+                        }));
+                }
+                if self.player.client_side {
+                    self.player.last_fall_flying_wall_sound_tick =
+                        Some(self.player.fall_fly_ticks);
+                }
                 // Only the server hurts:
                 if !self.player.client_side {
                     let id = self
@@ -2087,6 +2106,8 @@ impl MotionWorld<'_, '_, '_> {
                     }
                 }
             }
+        } else {
+            self.player.last_fall_flying_wall_sound_tick = None;
         }
         Ok(())
     }
@@ -4100,9 +4121,20 @@ mod tests {
             )
         };
         assert_eq!(w.player.events.iter().filter(|e| is_fall(e)).count(), 1);
-        // The sound must play only once on impact, not repeat on subsequent ticks (#12304):
-        w.travel_fall_flying().unwrap();
-        assert_eq!(w.player.events.iter().filter(|e| is_fall(e)).count(), 1);
+        // FireworkRocketEntity.tick restores horizontal speed after each move.
+        // Reapply that boost while the player remains against the same wall.
+        for _ in 0..2 {
+            let m = w.player.velocity;
+            let look = horizon_world::view_direction::view_vector(w.player.pitch, w.player.yaw);
+            w.player.velocity = Vec3::new(
+                m.x + look.x * 0.1 + (look.x * 1.5 - m.x) * 0.5,
+                m.y + look.y * 0.1 + (look.y * 1.5 - m.y) * 0.5,
+                m.z + look.z * 0.1 + (look.z * 1.5 - m.z) * 0.5,
+            );
+            w.player.fall_fly_ticks += 1;
+            w.travel_fall_flying().unwrap();
+            assert_eq!(w.player.events.iter().filter(|e| is_fall(e)).count(), 1);
+        }
         assert!(
             !w.player
                 .hurt_log
