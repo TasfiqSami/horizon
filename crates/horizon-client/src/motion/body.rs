@@ -53,6 +53,7 @@ impl PlayerMotion {
             fall_flying: false,
             sleeping: false,
             fall_fly_ticks: 0,
+            last_fall_flying_wall_sound_tick: None,
             glide_ending: false,
             server_owns_glide: false,
             glider_wear: 0,
